@@ -9,7 +9,7 @@
       Works across workspaces—open, close, and move windows without touching a layout shortcut.
     </td>
     <td>
-      <img src="assets/screenshot.png" width="300">
+      <img src="https://github.com/visnudeva/TileFlow/blob/09a77585efe287866413267346b3a6dbcbd95bc6/Screenshot.png" width="300">
     </td>
   </tr>
 </table>
