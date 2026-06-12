@@ -1,4 +1,4 @@
-# <img src="https://github.com/visnudeva/TileFlow/blob/cfe6c168589ced3f97004dfecc97084b7c84d952/TileFlow.png" width="100"> TileFlow
+# <img src="https://github.com/visnudeva/TileFlow/blob/cfe6c168589ced3f97004dfecc97084b7c84d952/TileFlow.png?raw=true" width="100"> CyberGlow
 
 <table>
   <tr>
