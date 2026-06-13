@@ -55,6 +55,8 @@ export default class TileFlow extends Extension {
         this._wsHandlers = [];
         this._isTiling = false;
         this._retileId = null;
+        this._pendingFinalizeIdleIds = new Map();
+        this._firefoxRetileIds = new Map();
 
         this._connect(global.display, "window-created", (_d, w) => this._onWindowCreated(w));
         this._connect(global.display, "window-entered-monitor", () => this._scheduleRetile());
@@ -136,6 +138,14 @@ export default class TileFlow extends Extension {
             this._retileId = null;
         }
 
+        for (const id of this._pendingFinalizeIdleIds?.values() ?? [])
+            GLib.source_remove(id);
+        this._pendingFinalizeIdleIds?.clear();
+
+        for (const id of this._firefoxRetileIds?.values() ?? [])
+            GLib.source_remove(id);
+        this._firefoxRetileIds?.clear();
+
         if (this._workspaceChangeRetileId) {
             GLib.source_remove(this._workspaceChangeRetileId);
             this._workspaceChangeRetileId = null;
@@ -186,7 +196,7 @@ export default class TileFlow extends Extension {
                             && w.maximized_horizontally
                             && w.maximized_vertically);
                         if (hasMaximizedSibling) {
-                            metaWindow.unmaximize(Meta.MaximizeFlags.BOTH);
+                            metaWindow.unmaximize();
                             this._scheduleRetile();
                             return;
                         }
@@ -288,7 +298,7 @@ export default class TileFlow extends Extension {
             this._resetWorkspaceLayoutState(ws);
 
         if (this._isTileable(metaWindow))
-            metaWindow.unmaximize(Meta.MaximizeFlags.BOTH);
+            metaWindow.unmaximize();
 
         if (isManualMove) {
             this._rememberManualMoveSide(metaWindow, newWs, prevWs);
@@ -341,7 +351,7 @@ export default class TileFlow extends Extension {
 
         for (const w of this._tileableWindows(workspace, true)) {
             if (w.maximized_horizontally || w.maximized_vertically)
-                w.unmaximize(Meta.MaximizeFlags.BOTH);
+                w.unmaximize();
         }
     }
 
@@ -510,7 +520,7 @@ export default class TileFlow extends Extension {
             const existing = existingOnWs[0];
             this._workspaceOrder.set(ws, buildNewWindowPairOrder(existing, metaWindow));
             if (metaWindow.maximized_horizontally && metaWindow.maximized_vertically)
-                metaWindow.unmaximize(Meta.MaximizeFlags.BOTH);
+                metaWindow.unmaximize();
         }
 
         if (this._tileableCount(ws, true) > 2) {
@@ -555,19 +565,36 @@ export default class TileFlow extends Extension {
         this._watchForTransientParent(metaWindow);
 
         // Defer so transient_for is usually set before overflow/workspace logic runs.
-        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+        this._cancelPendingFinalize(metaWindow);
+        const idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._pendingFinalizeIdleIds.delete(metaWindow);
             this._finalizeNewWindow(metaWindow);
             return GLib.SOURCE_REMOVE;
         });
+        this._pendingFinalizeIdleIds.set(metaWindow, idleId);
+    }
+
+    _cancelPendingFinalize(metaWindow) {
+        const idleId = this._pendingFinalizeIdleIds?.get(metaWindow);
+        if (!idleId)
+            return;
+        GLib.source_remove(idleId);
+        this._pendingFinalizeIdleIds.delete(metaWindow);
     }
 
     _scheduleFirefoxRetile(workspace) {
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, FIREFOX_RETILE_DELAY_MS, () => {
+        const existingId = this._firefoxRetileIds.get(workspace);
+        if (existingId)
+            GLib.source_remove(existingId);
+
+        const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FIREFOX_RETILE_DELAY_MS, () => {
+            this._firefoxRetileIds.delete(workspace);
             if (workspace && this._tileableCount(workspace) >= 2
                 && !this._workspaceHasUserExpanded(workspace))
                 this._tileWorkspace(workspace);
             return GLib.SOURCE_REMOVE;
         });
+        this._firefoxRetileIds.set(workspace, timeoutId);
     }
 
     _isUserExpanded(metaWindow) {
@@ -731,7 +758,7 @@ export default class TileFlow extends Extension {
                     hasPendingTileable: this._hasPendingTileable(workspace),
                     hasJoiningNormalWindow,
                 })) {
-                w.unmaximize(Meta.MaximizeFlags.BOTH);
+                w.unmaximize();
             }
             return;
         }
@@ -741,7 +768,7 @@ export default class TileFlow extends Extension {
 
         for (const w of windows) {
             if (!this._isUserExpanded(w))
-                w.unmaximize(Meta.MaximizeFlags.BOTH);
+                w.unmaximize();
         }
     }
 
@@ -839,9 +866,9 @@ export default class TileFlow extends Extension {
     }
 
     _maximizeWindow(metaWindow, area) {
-        metaWindow.unmaximize(Meta.MaximizeFlags.BOTH);
+        metaWindow.unmaximize();
         metaWindow.move_resize_frame(false, area.x, area.y, area.width, area.height);
-        metaWindow.maximize(Meta.MaximizeFlags.BOTH);
+        metaWindow.maximize();
 
         this._setExpectedGeometry(metaWindow, {
             x: area.x,
@@ -855,7 +882,7 @@ export default class TileFlow extends Extension {
 
     _tileLeft(metaWindow, area) {
         const {halfW, height, leftX, y} = halfTileGeometry(area);
-        metaWindow.unmaximize(Meta.MaximizeFlags.BOTH);
+        metaWindow.unmaximize();
         metaWindow.move_resize_frame(false, leftX, y, halfW, height);
 
         this._setExpectedGeometry(metaWindow, {
@@ -869,7 +896,7 @@ export default class TileFlow extends Extension {
 
     _tileRight(metaWindow, area) {
         const {halfW, height, rightX, y} = halfTileGeometry(area);
-        metaWindow.unmaximize(Meta.MaximizeFlags.BOTH);
+        metaWindow.unmaximize();
         metaWindow.move_resize_frame(false, rightX, y, halfW, height);
 
         this._setExpectedGeometry(metaWindow, {
