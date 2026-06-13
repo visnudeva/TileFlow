@@ -2,7 +2,7 @@
 
 https://github.com/user-attachments/assets/86a09b8e-3932-42ec-bf79-dce9f882df07
 
-# <img src="https://github.com/visnudeva/TileFlow/blob/cfe6c168589ced3f97004dfecc97084b7c84d952/TileFlow.png?raw=true" width="100"> TileFlow
+# <img src="assets/logo.png" width="50"> TileFlow
 
 <table>
   <tr>
@@ -13,7 +13,7 @@ https://github.com/user-attachments/assets/86a09b8e-3932-42ec-bf79-dce9f882df07
       Works across workspaces—open, close, and move windows without touching a layout shortcut.
     </td>
     <td>
-      <img src="https://github.com/visnudeva/TileFlow/blob/09a77585efe287866413267346b3a6dbcbd95bc6/Screenshot.png" width="300">
+      <img src="assets/screenshot.png" width="300">
     </td>
   </tr>
 </table>
@@ -39,17 +39,15 @@ Once published, install directly from [extensions.gnome.org](https://extensions.
 
 ### Manual Installation
 
-Download the .zip file, extract
+Clone or download this repository, then:
 
 ```bash
-# Copy to local extensions directory
-cp -r tileflow ~/.local/share/gnome-shell/extensions/tileflow@visnudeva.io
+cp -r TileFlow@visnudeva.github.io ~/.local/share/gnome-shell/extensions/
 
-# Enable the extension
-gnome-extensions enable tileflow@visnudeva.io
-
-# Restart GNOME Shell (Wayland: log out and back in, X11: Alt+F2, type 'r')
+gnome-extensions enable TileFlow@visnudeva.github.io
 ```
+
+Restart GNOME Shell after installation (Wayland: log out and back in; X11: Alt+F2, type `r`).
 
 ## How It Works
 
@@ -62,11 +60,19 @@ gnome-extensions enable tileflow@visnudeva.io
 
 The extension works out of the box with no configuration needed.
 
+## Development
+
+Run the unit tests:
+
+```bash
+node --test test/*.test.js
+```
+
 ## Troubleshooting
 
 **Extension not working?**
 - Ensure the extension is enabled: `gnome-extensions list --enabled`
-- Check logs: `journalctl -f | grep -i "tileflow"`
+- Check logs: `journalctl -f -o cat | grep -i tileflow`
 - Restart GNOME Shell after installation
 
 **A window is not tiling?**
@@ -76,7 +82,7 @@ The extension works out of the box with no configuration needed.
 
 ## Requirements
 
-- GNOME Shell 49–50
+- GNOME Shell 48–50
 
 ## License
 
@@ -84,4 +90,4 @@ GNU General Public License v2.0 or later. See the [LICENSE](LICENSE) file for de
 
 ## Contributing
 
-Issues and pull requests welcome at [GitHub](https://github.com/visnudeva/tileflow).
+Issues and pull requests welcome at [GitHub](https://github.com/visnudeva/TileFlow).
