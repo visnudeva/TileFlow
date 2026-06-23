@@ -24,23 +24,20 @@ import {
     shouldMaximizeLoneWindow,
     shouldPreserveLoneWindowGeometry,
 } from "./lib/layout.js";
-import {isFirefox, isLikelyMediaWindow} from "./lib/window-identification.js";
+import {isLateGeometryApp, isLikelyMediaWindow} from "./lib/window-identification.js";
 import {isManualCrossWorkspaceMove} from "./lib/workspace-move.js";
 
 const PENDING_TILE_TIMEOUT_MS = 200;
-const FIREFOX_RETILE_DELAY_MS = 400;
+const LATE_GEOMETRY_GRACE_MS = 4000;
 const UNMAXIMIZE_RETILE_DELAY_MS = 350;
 const WORKSPACE_CHANGE_RETILE_DELAY_MS = 120;
 
 export default class TileFlow extends Extension {
 
     enable() {
-        this._handlers = [];
         this._pendingWindows = new Map();
         this._windowCreationTimes = new Map();
         this._windowWorkspaceChangeTimes = new Map();
-        this._workspaceHandlers = new Map();
-        this._wsChangeHandlers = new Map();
         this._previousWorkspaces = new WeakMap();
         this._workspaceChangeRetileId = null;
         this._pendingWorkspaceRelayouts = new Set();
@@ -52,41 +49,50 @@ export default class TileFlow extends Extension {
         this._expectedGeometries = new WeakMap();
         this._userExpanded = new WeakMap();
         this._unmaximizeRetileIds = new Map();
-        this._wsHandlers = [];
+        this._connectedWindows = new Set();
+        this._workspaceChangeWindows = new Set();
+        this._tileSignalWindows = new Set();
+        this._transientParentTrackers = new Map();
         this._isTiling = false;
         this._retileId = null;
         this._pendingFinalizeIdleIds = new Map();
-        this._firefoxRetileIds = new Map();
 
-        this._connect(global.display, "window-created", (_d, w) => this._onWindowCreated(w));
-        this._connect(global.display, "window-entered-monitor", () => this._scheduleRetile());
-        this._connect(global.display, "window-left-monitor", () => this._scheduleRetile());
-        this._connect(global.window_manager, "destroy", () => this._scheduleRetile());
-        this._connect(global.window_manager, "switch-workspace", () => this._scheduleRetile());
+        global.display.connectObject(
+            "window-created", (_d, w) => this._onWindowCreated(w),
+            "window-entered-monitor", () => this._scheduleRetile(),
+            "window-left-monitor", () => this._scheduleRetile(),
+            this);
+
+        global.window_manager.connectObject(
+            "destroy", () => this._scheduleRetile(),
+            "switch-workspace", () => this._scheduleRetile(),
+            this);
 
         const wsManager = global.workspace_manager;
         const trackWorkspace = (ws) => {
-            this._wsHandlers.push([ws, ws.connect("window-added", (_ws, window) => {
-                const isManualMove = this._isManualWorkspaceMove(window, ws);
-                if (window?.get_window_type?.() === Meta.WindowType.NORMAL && !isManualMove)
-                    this._resetWorkspaceLayoutState(ws);
-                if (!isManualMove)
+            ws.connectObject(
+                "window-added", (_ws, window) => {
+                    const isManualMove = this._isManualWorkspaceMove(window, ws);
+                    if (window?.get_window_type?.() === Meta.WindowType.NORMAL && !isManualMove)
+                        this._resetWorkspaceLayoutState(ws);
+                    if (!isManualMove)
+                        this._scheduleRetile();
+                },
+                "window-removed", (_ws, window) => {
+                    if (window?.get_window_type?.() === Meta.WindowType.NORMAL)
+                        this._resetWorkspaceLayoutState(ws);
                     this._scheduleRetile();
-            })]);
-            this._wsHandlers.push([ws, ws.connect("window-removed", (_ws, window) => {
-                if (window?.get_window_type?.() === Meta.WindowType.NORMAL)
-                    this._resetWorkspaceLayoutState(ws);
-                this._scheduleRetile();
-            })]);
+                },
+                this);
         };
 
         for (let i = 0; i < wsManager.get_n_workspaces(); i++)
             trackWorkspace(wsManager.get_workspace_by_index(i));
 
-        this._connect(wsManager, "workspace-added", (_wm, ws) => {
+        wsManager.connectObject("workspace-added", (_wm, ws) => {
             trackWorkspace(ws);
             this._scheduleRetile();
-        });
+        }, this);
 
         for (const w of global.display.list_all_windows()) {
             if (w.get_window_type() === Meta.WindowType.NORMAL) {
@@ -99,89 +105,102 @@ export default class TileFlow extends Extension {
     }
 
     disable() {
-        for (const [obj, id] of this._handlers) {
-            try { obj.disconnect(id); } catch (_e) {}
-        }
-        this._handlers = [];
+        global.display.disconnectObject(this);
+        global.window_manager.disconnectObject(this);
 
-        for (const [ws, id] of this._wsHandlers ?? []) {
-            try { ws.disconnect(id); } catch (_e) {}
-        }
-        this._wsHandlers = [];
+        const wsManager = global.workspace_manager;
+        wsManager.disconnectObject(this);
+        for (let i = 0; i < wsManager.get_n_workspaces(); i++)
+            wsManager.get_workspace_by_index(i).disconnectObject(this);
 
-        for (const [window, info] of this._pendingWindows ?? []) {
+        for (const [window, info] of this._pendingWindows ?? [])
             this._clearPendingInfo(window, info);
-        }
-        this._pendingWindows?.clear();
 
-        for (const window of Array.from(this._workspaceHandlers?.keys() ?? []))
-            this._untrackWindow(window);
-        this._workspaceHandlers?.clear();
+        for (const window of Array.from(this._connectedWindows ?? []))
+            this._releaseWindow(window);
 
-        for (const window of Array.from(this._wsChangeHandlers?.keys() ?? []))
-            this._untrackWorkspaceChanges(window);
-        this._wsChangeHandlers?.clear();
+        for (const [window, tracker] of Array.from(this._transientParentTrackers?.entries() ?? []))
+            window.disconnectObject(tracker);
 
-        this._expectedGeometries = null;
-        this._userExpanded = null;
+        for (const id of this._unmaximizeRetileIds?.values() ?? [])
+            GLib.source_remove(id);
+
+        if (this._retileId)
+            GLib.source_remove(this._retileId);
+
+        for (const id of this._pendingFinalizeIdleIds?.values() ?? [])
+            GLib.source_remove(id);
+
+        if (this._workspaceChangeRetileId)
+            GLib.source_remove(this._workspaceChangeRetileId);
+
+        this._pendingWindows = null;
+        this._windowCreationTimes = null;
+        this._windowWorkspaceChangeTimes = null;
+        this._previousWorkspaces = null;
+        this._workspaceChangeRetileId = null;
+        this._pendingWorkspaceRelayouts = null;
+        this._workspaceOrder = null;
         this._manualMoveSide = null;
         this._pendingManualWorkspaceMoves = null;
         this._manualMovePrevWorkspace = null;
         this._extensionWorkspaceMoves = null;
-
-        for (const id of this._unmaximizeRetileIds?.values() ?? [])
-            GLib.source_remove(id);
-        this._unmaximizeRetileIds?.clear();
-
-        if (this._retileId) {
-            GLib.source_remove(this._retileId);
-            this._retileId = null;
-        }
-
-        for (const id of this._pendingFinalizeIdleIds?.values() ?? [])
-            GLib.source_remove(id);
-        this._pendingFinalizeIdleIds?.clear();
-
-        for (const id of this._firefoxRetileIds?.values() ?? [])
-            GLib.source_remove(id);
-        this._firefoxRetileIds?.clear();
-
-        if (this._workspaceChangeRetileId) {
-            GLib.source_remove(this._workspaceChangeRetileId);
-            this._workspaceChangeRetileId = null;
-        }
-        this._pendingWorkspaceRelayouts?.clear();
+        this._expectedGeometries = null;
+        this._userExpanded = null;
+        this._unmaximizeRetileIds = null;
+        this._connectedWindows = null;
+        this._workspaceChangeWindows = null;
+        this._tileSignalWindows = null;
+        this._transientParentTrackers = null;
+        this._isTiling = false;
+        this._retileId = null;
+        this._pendingFinalizeIdleIds = null;
     }
 
-    _connect(obj, signal, callback) {
-        this._handlers.push([obj, obj.connect(signal, callback)]);
+    _runWhileTiling(fn) {
+        const wasTiling = this._isTiling;
+        this._isTiling = true;
+        fn();
+        this._isTiling = wasTiling;
+    }
+
+    _isWithinOpeningGrace(metaWindow) {
+        if (this._pendingWindows?.has(metaWindow))
+            return true;
+
+        const created = this._windowCreationTimes?.get(metaWindow);
+        if (created == null || created < 1_000_000_000_000)
+            return false;
+
+        return Date.now() - created < LATE_GEOMETRY_GRACE_MS;
+    }
+
+    _shouldIgnoreLateAppMaximize(metaWindow) {
+        return isLateGeometryApp(metaWindow) && this._isWithinOpeningGrace(metaWindow);
     }
 
     _trackWindow(metaWindow) {
-        if (!this._isTileable(metaWindow) || this._workspaceHandlers.has(metaWindow))
+        if (!this._isTileable(metaWindow) || this._tileSignalWindows.has(metaWindow))
             return;
 
-        this._workspaceHandlers.set(metaWindow, []);
+        this._tileSignalWindows.add(metaWindow);
+        this._connectedWindows.add(metaWindow);
         if (!this._windowCreationTimes.has(metaWindow))
             this._windowCreationTimes.set(metaWindow, metaWindow.get_id());
 
-        this._windowHandler(metaWindow, "size-changed", () => {
-            if (this._isTiling || this._shouldDeferRetile()
-                || this._isUserExpanded(metaWindow)
-                || this._isGeometryMatching(metaWindow))
-                return;
-            this._scheduleRetile();
-        });
-
         const onMaximizeChange = () => {
             if (this._isTiling)
+                return;
+
+            const ws = metaWindow.get_workspace();
+            if (!ws)
                 return;
 
             const isMaximized = metaWindow.maximized_horizontally
                 && metaWindow.maximized_vertically;
             const isPartiallyMaximized = metaWindow.maximized_horizontally
                 || metaWindow.maximized_vertically;
-            const multiWindow = this._tileableCount(metaWindow.get_workspace()) >= 2;
+            const multiWindow = this._tileableCount(ws) >= 2;
             const expected = this._expectedGeometries?.get(metaWindow);
 
             if (isMaximized) {
@@ -195,15 +214,21 @@ export default class TileFlow extends Extension {
                         ).some(w => w !== metaWindow
                             && w.maximized_horizontally
                             && w.maximized_vertically);
-                        if (hasMaximizedSibling) {
+                        if (hasMaximizedSibling || this._shouldIgnoreLateAppMaximize(metaWindow)) {
                             metaWindow.unmaximize();
                             this._scheduleRetile();
                             return;
                         }
                     }
 
-                    if (!expected || !expected.maximized)
+                    if (!expected || !expected.maximized) {
+                        if (this._shouldIgnoreLateAppMaximize(metaWindow)) {
+                            metaWindow.unmaximize();
+                            this._scheduleRetile();
+                            return;
+                        }
                         this._userExpanded.set(metaWindow, true);
+                    }
                 }
                 this._updateExpectedGeometry(metaWindow);
                 return;
@@ -212,7 +237,8 @@ export default class TileFlow extends Extension {
             // Mark user intent early so a retile during the maximize animation
             // does not snap the window back to a half tile.
             if (multiWindow && isPartiallyMaximized && !this._pendingWindows.has(metaWindow)
-                && (!expected || !expected.maximized)) {
+                && (!expected || !expected.maximized)
+                && !this._shouldIgnoreLateAppMaximize(metaWindow)) {
                 this._userExpanded.set(metaWindow, true);
             }
 
@@ -221,55 +247,44 @@ export default class TileFlow extends Extension {
                 return;
             }
 
-            if (multiWindow && isFirefox(metaWindow)) {
-                this._scheduleRetile();
-                return;
-            }
-
             if (!this._isGeometryMatching(metaWindow))
                 this._updateExpectedGeometry(metaWindow);
         };
 
-        this._windowHandler(metaWindow, "notify::maximized-horizontally", onMaximizeChange);
-        this._windowHandler(metaWindow, "notify::maximized-vertically", onMaximizeChange);
-        this._windowHandler(metaWindow, "notify::fullscreen", () => this._scheduleRetile());
-    }
-
-    _windowHandler(metaWindow, signal, callback) {
-        this._workspaceHandlers.get(metaWindow).push(metaWindow.connect(signal, callback));
+        metaWindow.connectObject(
+            "size-changed", () => {
+                if (this._isTiling || this._shouldDeferRetile()
+                    || this._isUserExpanded(metaWindow)
+                    || this._isGeometryMatching(metaWindow))
+                    return;
+                this._scheduleRetile();
+            },
+            "notify::maximized-horizontally", onMaximizeChange,
+            "notify::maximized-vertically", onMaximizeChange,
+            "notify::fullscreen", () => this._scheduleRetile(),
+            metaWindow);
     }
 
     _trackWorkspaceChanges(metaWindow) {
-        if (this._wsChangeHandlers.has(metaWindow))
+        if (this._workspaceChangeWindows.has(metaWindow))
             return;
 
-        const handlers = [];
-        this._wsChangeHandlers.set(metaWindow, handlers);
+        this._workspaceChangeWindows.add(metaWindow);
+        this._connectedWindows.add(metaWindow);
         this._previousWorkspaces.set(metaWindow, metaWindow.get_workspace());
 
         const onWorkspaceChange = () => {
             this._onWindowWorkspaceChanged(metaWindow);
         };
 
-        const add = (signal, callback) => {
-            handlers.push(metaWindow.connect(signal, callback));
-        };
-
-        add("notify::workspace", onWorkspaceChange);
-        add("workspace-changed", onWorkspaceChange);
-        add("unmanaged", () => {
-            this._untrackWindow(metaWindow);
-            this._untrackWorkspaceChanges(metaWindow);
-            this._scheduleRetile();
-        });
-    }
-
-    _untrackWorkspaceChanges(metaWindow) {
-        for (const id of this._wsChangeHandlers.get(metaWindow) ?? []) {
-            try { metaWindow.disconnect(id); } catch (_e) {}
-        }
-        this._wsChangeHandlers.delete(metaWindow);
-        this._previousWorkspaces?.delete(metaWindow);
+        metaWindow.connectObject(
+            "notify::workspace", onWorkspaceChange,
+            "workspace-changed", onWorkspaceChange,
+            "unmanaged", () => {
+                this._releaseWindow(metaWindow);
+                this._scheduleRetile();
+            },
+            metaWindow);
     }
 
     _onWindowWorkspaceChanged(metaWindow) {
@@ -308,14 +323,10 @@ export default class TileFlow extends Extension {
                 this._retileId = null;
             }
 
-            const wasTiling = this._isTiling;
-            this._isTiling = true;
-            try {
+            this._runWhileTiling(() => {
                 for (const ws of affected)
                     this._tileWorkspace(ws);
-            } finally {
-                this._isTiling = wasTiling;
-            }
+            });
         }
 
         this._scheduleRetileAfterWorkspaceChange(affected);
@@ -395,24 +406,22 @@ export default class TileFlow extends Extension {
                     }
                 }
 
-                const wasTiling = this._isTiling;
-                this._isTiling = true;
-                try {
+                this._runWhileTiling(() => {
                     for (const ws of affected)
                         this._tileWorkspace(ws);
-                } finally {
-                    this._isTiling = wasTiling;
-                }
+                });
                 return GLib.SOURCE_REMOVE;
             }
         );
     }
 
-    _untrackWindow(metaWindow) {
-        for (const id of this._workspaceHandlers.get(metaWindow) ?? []) {
-            try { metaWindow.disconnect(id); } catch (_e) {}
-        }
-        this._workspaceHandlers.delete(metaWindow);
+    _releaseWindow(metaWindow) {
+        this._disconnectTransientParentWatch(metaWindow);
+        metaWindow.disconnectObject(metaWindow);
+        this._connectedWindows?.delete(metaWindow);
+        this._workspaceChangeWindows?.delete(metaWindow);
+        this._tileSignalWindows?.delete(metaWindow);
+        this._previousWorkspaces?.delete(metaWindow);
         this._userExpanded?.delete(metaWindow);
         this._cancelUnmaximizeRetile(metaWindow);
         this._windowCreationTimes.delete(metaWindow);
@@ -430,12 +439,8 @@ export default class TileFlow extends Extension {
     }
 
     _clearPendingInfo(metaWindow, info) {
-        if (info.shownId) {
-            try { metaWindow.disconnect(info.shownId); } catch (_e) {}
-        }
-        if (info.frameId && info.actor) {
-            try { info.actor.disconnect(info.frameId); } catch (_e) {}
-        }
+        metaWindow.disconnectObject(info);
+        info.actor?.disconnectObject(info);
         if (info.timeoutId)
             GLib.source_remove(info.timeoutId);
     }
@@ -471,16 +476,27 @@ export default class TileFlow extends Extension {
         metaWindow.raise();
     }
 
+    _disconnectTransientParentWatch(metaWindow) {
+        const tracker = this._transientParentTrackers?.get(metaWindow);
+        if (!tracker)
+            return;
+        metaWindow.disconnectObject(tracker);
+        this._transientParentTrackers.delete(metaWindow);
+    }
+
     _watchForTransientParent(metaWindow) {
-        if (this._getTransientParent(metaWindow))
+        if (this._getTransientParent(metaWindow)
+            || this._transientParentTrackers?.has(metaWindow))
             return;
 
-        const transientId = metaWindow.connect("notify::transient-for", () => {
-            try { metaWindow.disconnect(transientId); } catch (_e) {}
+        const tracker = {};
+        this._transientParentTrackers.set(metaWindow, tracker);
+        metaWindow.connectObject("notify::transient-for", () => {
+            this._disconnectTransientParentWatch(metaWindow);
             const parent = this._getTransientParent(metaWindow);
             if (parent)
                 this._ensureChildOnParentWorkspace(metaWindow, parent);
-        });
+        }, tracker);
     }
 
     _tileableWindows(workspace, includePending = false) {
@@ -519,7 +535,8 @@ export default class TileFlow extends Extension {
         if (existingOnWs.length === 1) {
             const existing = existingOnWs[0];
             this._workspaceOrder.set(ws, buildNewWindowPairOrder(existing, metaWindow));
-            if (metaWindow.maximized_horizontally && metaWindow.maximized_vertically)
+            const wasMaximized = metaWindow.maximized_horizontally && metaWindow.maximized_vertically;
+            if (wasMaximized)
                 metaWindow.unmaximize();
         }
 
@@ -551,15 +568,12 @@ export default class TileFlow extends Extension {
                 this._workspaceOrder.set(destWs, buildOverflowJoinPairOrder(joinExistingOnNext, metaWindow));
             }
             this._tileWorkspace(destWs);
-            if (isFirefox(metaWindow))
-                this._scheduleFirefoxRetile(destWs);
         });
     }
 
     _onWindowCreated(metaWindow) {
         if (metaWindow.get_window_type() !== Meta.WindowType.NORMAL)
             return;
-
         this._windowCreationTimes.set(metaWindow, Date.now());
         this._trackWorkspaceChanges(metaWindow);
         this._watchForTransientParent(metaWindow);
@@ -580,21 +594,6 @@ export default class TileFlow extends Extension {
             return;
         GLib.source_remove(idleId);
         this._pendingFinalizeIdleIds.delete(metaWindow);
-    }
-
-    _scheduleFirefoxRetile(workspace) {
-        const existingId = this._firefoxRetileIds.get(workspace);
-        if (existingId)
-            GLib.source_remove(existingId);
-
-        const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FIREFOX_RETILE_DELAY_MS, () => {
-            this._firefoxRetileIds.delete(workspace);
-            if (workspace && this._tileableCount(workspace) >= 2
-                && !this._workspaceHasUserExpanded(workspace))
-                this._tileWorkspace(workspace);
-            return GLib.SOURCE_REMOVE;
-        });
-        this._firefoxRetileIds.set(workspace, timeoutId);
     }
 
     _isUserExpanded(metaWindow) {
@@ -631,7 +630,7 @@ export default class TileFlow extends Extension {
     }
 
     _waitForWindowReady(metaWindow, callback) {
-        const info = {shownId: null, frameId: null, timeoutId: null, actor: null};
+        const info = {timeoutId: null, actor: null};
         this._pendingWindows.set(metaWindow, info);
 
         let done = false;
@@ -652,17 +651,17 @@ export default class TileFlow extends Extension {
         const actor = metaWindow.get_compositor_private();
         if (actor) {
             info.actor = actor;
-            info.frameId = actor.connect("first-frame", finish);
+            actor.connectObject("first-frame", finish, info);
         } else {
-            info.shownId = metaWindow.connect("shown", () => {
+            metaWindow.connectObject("shown", () => {
                 const act = metaWindow.get_compositor_private();
-                if (act && !info.frameId) {
+                if (act && !info.actor) {
                     info.actor = act;
-                    info.frameId = act.connect("first-frame", finish);
+                    act.connectObject("first-frame", finish, info);
                 } else {
                     finish();
                 }
-            });
+            }, info);
         }
     }
 
@@ -692,15 +691,11 @@ export default class TileFlow extends Extension {
             if (this._shouldDeferRetile())
                 return GLib.SOURCE_REMOVE;
             this._retileId = null;
-            const wasTiling = this._isTiling;
-            this._isTiling = true;
-            try {
+            this._runWhileTiling(() => {
                 const wsManager = global.workspace_manager;
                 for (let i = 0; i < wsManager.get_n_workspaces(); i++)
                     this._tileWorkspace(wsManager.get_workspace_by_index(i));
-            } finally {
-                this._isTiling = wasTiling;
-            }
+            });
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -802,9 +797,7 @@ export default class TileFlow extends Extension {
             return;
         }
 
-        const wasTiling = this._isTiling;
-        this._isTiling = true;
-        try {
+        this._runWhileTiling(() => {
             if (windows.length === 1) {
                 if (shouldMaximizeLoneWindow({
                     tileableCount: windows.length,
@@ -848,9 +841,7 @@ export default class TileFlow extends Extension {
             this._tileRight(orderedWindows[1], area);
             this._raiseTransients(orderedWindows[0]);
             this._raiseTransients(orderedWindows[1]);
-        } finally {
-            this._isTiling = wasTiling;
-        }
+        });
     }
 
     _raiseTransients(metaWindow) {
