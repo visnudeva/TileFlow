@@ -24,7 +24,12 @@ import {
     shouldMaximizeLoneWindow,
     shouldPreserveLoneWindowGeometry,
 } from "./lib/layout.js";
-import {isLateGeometryApp, isLikelyMediaWindow} from "./lib/window-identification.js";
+import {
+    affectsTilingLayout,
+    isEphemeralUiWindowType,
+    isLaniakeaRenderer,
+    isLateGeometryApp,
+} from "./lib/window-identification.js";
 import {isManualCrossWorkspaceMove} from "./lib/workspace-move.js";
 
 const PENDING_TILE_TIMEOUT_MS = 200;
@@ -59,12 +64,23 @@ export default class TileFlow extends Extension {
 
         global.display.connectObject(
             "window-created", (_d, w) => this._onWindowCreated(w),
-            "window-entered-monitor", () => this._scheduleRetile(),
-            "window-left-monitor", () => this._scheduleRetile(),
+            "window-entered-monitor", (_d, _monitor, window) => {
+                if (this._affectsTilingLayout(window))
+                    this._scheduleRetile();
+            },
+            "window-left-monitor", (_d, _monitor, window) => {
+                if (this._affectsTilingLayout(window))
+                    this._scheduleRetile();
+            },
             this);
 
         global.window_manager.connectObject(
-            "destroy", () => this._scheduleRetile(),
+            "destroy", (_wm, actor) => {
+                const window = actor?.meta_window;
+                if (!this._affectsTilingLayout(window))
+                    return;
+                this._scheduleRetile();
+            },
             "switch-workspace", () => this._scheduleRetile(),
             this);
 
@@ -72,15 +88,17 @@ export default class TileFlow extends Extension {
         const trackWorkspace = (ws) => {
             ws.connectObject(
                 "window-added", (_ws, window) => {
-                    const isManualMove = this._isManualWorkspaceMove(window, ws);
-                    if (window?.get_window_type?.() === Meta.WindowType.NORMAL && !isManualMove)
-                        this._resetWorkspaceLayoutState(ws);
-                    if (!isManualMove)
-                        this._scheduleRetile();
+                    if (!this._affectsTilingLayout(window))
+                        return;
+                    if (this._isManualWorkspaceMove(window, ws))
+                        return;
+                    this._resetWorkspaceLayoutState(ws);
+                    this._scheduleRetile();
                 },
                 "window-removed", (_ws, window) => {
-                    if (window?.get_window_type?.() === Meta.WindowType.NORMAL)
-                        this._resetWorkspaceLayoutState(ws);
+                    if (!this._affectsTilingLayout(window))
+                        return;
+                    this._resetWorkspaceLayoutState(ws);
                     this._scheduleRetile();
                 },
                 this);
@@ -95,7 +113,7 @@ export default class TileFlow extends Extension {
         }, this);
 
         for (const w of global.display.list_all_windows()) {
-            if (w.get_window_type() === Meta.WindowType.NORMAL) {
+            if (this._affectsTilingLayout(w)) {
                 this._windowCreationTimes.set(w, w.get_id());
                 this._trackWorkspaceChanges(w);
             }
@@ -453,11 +471,25 @@ export default class TileFlow extends Extension {
         return !!this._getTransientParent(metaWindow);
     }
 
+    _isEphemeralUiWindow(metaWindow) {
+        if (!metaWindow?.get_window_type)
+            return false;
+        return isEphemeralUiWindowType(metaWindow.get_window_type(), Meta.WindowType);
+    }
+
+    _affectsTilingLayout(metaWindow) {
+        return affectsTilingLayout(metaWindow, Meta.WindowType);
+    }
+
+    _windowHasTransientChildren(metaWindow) {
+        return global.display.list_all_windows().some(w =>
+            w.get_transient_for() === metaWindow
+        );
+    }
+
     _isTileable(metaWindow) {
-        return metaWindow.get_window_type() === Meta.WindowType.NORMAL
-            && !this._isChildWindow(metaWindow)
-            && !metaWindow.is_fullscreen()
-            && !isLikelyMediaWindow(metaWindow);
+        return this._affectsTilingLayout(metaWindow)
+            && !metaWindow.is_fullscreen();
     }
 
     _ensureChildOnParentWorkspace(metaWindow, parent) {
@@ -574,6 +606,8 @@ export default class TileFlow extends Extension {
     _onWindowCreated(metaWindow) {
         if (metaWindow.get_window_type() !== Meta.WindowType.NORMAL)
             return;
+        if (isLaniakeaRenderer(metaWindow))
+            return;
         this._windowCreationTimes.set(metaWindow, Date.now());
         this._trackWorkspaceChanges(metaWindow);
         this._watchForTransientParent(metaWindow);
@@ -669,15 +703,17 @@ export default class TileFlow extends Extension {
         if (Main.modalCount > 0)
             return true;
 
-        return global.display.list_all_windows().some(w => {
-            const type = w.get_window_type();
-            return type === Meta.WindowType.MENU
-                || type === Meta.WindowType.DROPDOWN_MENU
-                || type === Meta.WindowType.POPUP
-                || type === Meta.WindowType.COMBO
-                || type === Meta.WindowType.TOOLTIP
-                || type === Meta.WindowType.UTILITY;
-        });
+        const windows = global.display.list_all_windows();
+        if (windows.some(w =>
+            this._isEphemeralUiWindow(w) || w.get_window_type() === Meta.WindowType.UTILITY
+        ))
+            return true;
+
+        // Menus on child dialogs are often NORMAL/skip-taskbar, not MENU-typed.
+        // Any transient of a child means popup UI is open — don't retile/raise under it.
+        return windows.some(child =>
+            this._isChildWindow(child) && this._windowHasTransientChildren(child)
+        );
     }
 
     _scheduleRetile() {
@@ -688,9 +724,9 @@ export default class TileFlow extends Extension {
             GLib.source_remove(this._retileId);
 
         this._retileId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._retileId = null;
             if (this._shouldDeferRetile())
                 return GLib.SOURCE_REMOVE;
-            this._retileId = null;
             this._runWhileTiling(() => {
                 const wsManager = global.workspace_manager;
                 for (let i = 0; i < wsManager.get_n_workspaces(); i++)
@@ -839,15 +875,21 @@ export default class TileFlow extends Extension {
             this._workspaceOrder.set(workspace, orderedWindows);
             this._tileLeft(orderedWindows[0], area);
             this._tileRight(orderedWindows[1], area);
-            this._raiseTransients(orderedWindows[0]);
-            this._raiseTransients(orderedWindows[1]);
+            if (!this._shouldDeferRetile()) {
+                this._raiseTransients(orderedWindows[0]);
+                this._raiseTransients(orderedWindows[1]);
+            }
         });
     }
 
     _raiseTransients(metaWindow) {
         for (const w of global.display.list_all_windows()) {
-            if (w.get_transient_for() === metaWindow)
-                w.raise();
+            if (w.get_transient_for() !== metaWindow || this._isEphemeralUiWindow(w))
+                continue;
+            // Raising a child while it has a menu/popup open causes stacking flicker.
+            if (this._windowHasTransientChildren(w))
+                continue;
+            w.raise();
         }
     }
 
@@ -856,7 +898,21 @@ export default class TileFlow extends Extension {
             this._expectedGeometries.set(metaWindow, geometry);
     }
 
+    _canSafelyResize(metaWindow) {
+        if (!metaWindow || metaWindow.is_destroyed?.())
+            return false;
+        if (isLaniakeaRenderer(metaWindow))
+            return false;
+        // Avoid move_resize while the Wayland xdg_toplevel is still constructing.
+        if (!metaWindow.get_compositor_private?.())
+            return false;
+        return true;
+    }
+
     _maximizeWindow(metaWindow, area) {
+        if (!this._canSafelyResize(metaWindow) || !area)
+            return;
+
         metaWindow.unmaximize();
         metaWindow.move_resize_frame(false, area.x, area.y, area.width, area.height);
         metaWindow.maximize();
@@ -868,15 +924,27 @@ export default class TileFlow extends Extension {
             height: area.height,
             maximized: true,
         });
-        this._raiseTransients(metaWindow);
+        if (!this._shouldDeferRetile())
+            this._raiseTransients(metaWindow);
+    }
+
+    _applyTileGeometry(metaWindow, geometry) {
+        if (!this._canSafelyResize(metaWindow) || !geometry)
+            return;
+
+        const needsResize = !geometryMatches(metaWindow, geometry);
+        if (needsResize) {
+            metaWindow.unmaximize();
+            metaWindow.move_resize_frame(
+                false, geometry.x, geometry.y, geometry.width, geometry.height
+            );
+        }
+        this._setExpectedGeometry(metaWindow, geometry);
     }
 
     _tileLeft(metaWindow, area) {
         const {halfW, height, leftX, y} = halfTileGeometry(area);
-        metaWindow.unmaximize();
-        metaWindow.move_resize_frame(false, leftX, y, halfW, height);
-
-        this._setExpectedGeometry(metaWindow, {
+        this._applyTileGeometry(metaWindow, {
             x: leftX,
             y,
             width: halfW,
@@ -887,10 +955,7 @@ export default class TileFlow extends Extension {
 
     _tileRight(metaWindow, area) {
         const {halfW, height, rightX, y} = halfTileGeometry(area);
-        metaWindow.unmaximize();
-        metaWindow.move_resize_frame(false, rightX, y, halfW, height);
-
-        this._setExpectedGeometry(metaWindow, {
+        this._applyTileGeometry(metaWindow, {
             x: rightX,
             y,
             width: halfW,
