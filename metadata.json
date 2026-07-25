@@ -2,7 +2,7 @@
   "uuid": "TileFlow@visnudeva.github.io",
   "name": "TileFlow",
   "description": "Auto-tile windows: maximize singles, 50/50 left-right pairs, new workspace for extras.",
-  "version": 2,
+  "version": 3,
   "shell-version": ["48", "49", "50"],
   "url": "https://github.com/visnudeva/TileFlow",
   "donations": {
